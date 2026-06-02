@@ -1,0 +1,411 @@
+name: Java + Apache JMeter CI/CD Pipeline
+# Repo: https://github.com/itsrutik/conf
+# Stack: Java 11, Maven, JUnit 4, Apache JMeter 5.6.3
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      jmeter_version:
+        description: 'JMeter version'
+        required: false
+        default: '5.6.3'
+      test_plan:
+        description: 'JMX test plan path'
+        required: false
+        default: 'tests/test-plan.jmx'
+      skip_perf_tests:
+        description: 'Skip JMeter performance tests? (true/false)'
+        required: false
+        default: 'false'
+
+env:
+  JAVA_VERSION: '11'                                      # Matches pom.xml: source/target = 11
+  JMETER_VERSION: ${{ github.event.inputs.jmeter_version || '5.6.3' }}
+  JMETER_HOME: ${{ github.workspace }}/apache-jmeter
+  ARTIFACT_ID: java-project                               # Matches pom.xml artifactId
+  GROUP_ID: com.example                                   # Matches pom.xml groupId
+  APP_VERSION: 1.0.0                                      # Matches pom.xml version
+
+# ══════════════════════════════════════════════════════════════
+# JOB 1 — Maven Build + Unit Tests (JUnit 4)
+# ══════════════════════════════════════════════════════════════
+jobs:
+  build-and-test:
+    name: 🔨 Maven Build & JUnit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout itsrutik/conf
+        uses: actions/checkout@v4
+
+      - name: Set up Java ${{ env.JAVA_VERSION }} (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Compile Source Code
+        run: mvn compile -B
+
+      - name: Run JUnit 4 Unit Tests
+        run: mvn test -B
+
+      - name: Upload Surefire Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 14
+
+      - name: Package JAR
+        run: |
+          mvn package -B -DskipTests
+          echo "📦 Built JAR: target/${{ env.ARTIFACT_ID }}-${{ env.APP_VERSION }}.jar"
+
+      - name: Upload JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/${{ env.ARTIFACT_ID }}-${{ env.APP_VERSION }}.jar
+          retention-days: 7
+
+      - name: Publish Unit Test Summary
+        if: always()
+        run: |
+          echo "## 🧪 JUnit 4 Unit Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -d target/surefire-reports ]; then
+            TOTAL=$(grep -rh 'tests=' target/surefire-reports/*.xml 2>/dev/null | \
+              grep -oP 'tests="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            ERRORS=$(grep -rh 'errors=' target/surefire-reports/*.xml 2>/dev/null | \
+              grep -oP 'errors="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            FAILURES=$(grep -rh 'failures=' target/surefire-reports/*.xml 2>/dev/null | \
+              grep -oP 'failures="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            SKIPPED=$(grep -rh 'skipped=' target/surefire-reports/*.xml 2>/dev/null | \
+              grep -oP 'skipped="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔢 Total | ${TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Passed | $(( ${TOTAL:-0} - ${ERRORS:-0} - ${FAILURES:-0} - ${SKIPPED:-0} )) |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ Failures | ${FAILURES:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🚫 Errors | ${ERRORS:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏭️ Skipped | ${SKIPPED:-0} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No Surefire reports found._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+# ══════════════════════════════════════════════════════════════
+# JOB 2 — Install & Cache Apache JMeter
+# ══════════════════════════════════════════════════════════════
+  install-jmeter:
+    name: 📦 Install Apache JMeter ${{ github.event.inputs.jmeter_version || '5.6.3' }}
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: ${{ github.event.inputs.skip_perf_tests != 'true' }}
+
+    steps:
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache JMeter Installation
+        id: cache-jmeter
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JMETER_HOME }}
+          key: jmeter-${{ env.JMETER_VERSION }}-java${{ env.JAVA_VERSION }}
+
+      - name: Download Apache JMeter
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          echo "⬇️  Downloading Apache JMeter v${{ env.JMETER_VERSION }}..."
+          wget -q \
+            "https://downloads.apache.org/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz" \
+            -O /tmp/apache-jmeter.tgz
+
+          echo "📂 Extracting..."
+          tar -xzf /tmp/apache-jmeter.tgz -C ${{ github.workspace }}
+          mv "${{ github.workspace }}/apache-jmeter-${{ env.JMETER_VERSION }}" "${{ env.JMETER_HOME }}"
+          echo "✅ JMeter ready at ${{ env.JMETER_HOME }}"
+
+      - name: Install JMeter Plugins Manager
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          PLUGINS_MGR_VERSION="1.10"
+          wget -q \
+            "https://repo1.maven.org/maven2/kg/apc/jmeter-plugins-manager/${PLUGINS_MGR_VERSION}/jmeter-plugins-manager-${PLUGINS_MGR_VERSION}.jar" \
+            -O "${{ env.JMETER_HOME }}/lib/ext/jmeter-plugins-manager.jar"
+          echo "🔌 Plugins Manager v${PLUGINS_MGR_VERSION} installed"
+
+      - name: Verify JMeter
+        run: |
+          "${{ env.JMETER_HOME }}/bin/jmeter" --version
+
+# ══════════════════════════════════════════════════════════════
+# JOB 3 — Run JMeter Performance Tests
+# ══════════════════════════════════════════════════════════════
+  run-performance-tests:
+    name: 🚀 JMeter Performance Tests
+    runs-on: ubuntu-latest
+    needs: [build-and-test, install-jmeter]
+    if: ${{ github.event.inputs.skip_perf_tests != 'true' }}
+
+    steps:
+      - name: Checkout itsrutik/conf
+        uses: actions/checkout@v4
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Restore JMeter from Cache
+        id: cache-jmeter
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.JMETER_HOME }}
+          key: jmeter-${{ env.JMETER_VERSION }}-java${{ env.JAVA_VERSION }}
+
+      - name: Fallback — Download JMeter if Cache Missed
+        if: steps.cache-jmeter.outputs.cache-hit != 'true'
+        run: |
+          wget -q \
+            "https://downloads.apache.org/jmeter/binaries/apache-jmeter-${{ env.JMETER_VERSION }}.tgz" \
+            -O /tmp/apache-jmeter.tgz
+          tar -xzf /tmp/apache-jmeter.tgz -C ${{ github.workspace }}
+          mv "${{ github.workspace }}/apache-jmeter-${{ env.JMETER_VERSION }}" "${{ env.JMETER_HOME }}"
+
+      - name: Create Results Directory
+        run: mkdir -p ${{ github.workspace }}/results/html-report
+
+      - name: Scaffold Sample JMX Test Plan (if absent)
+        run: |
+          TEST_PLAN="${{ github.event.inputs.test_plan || 'tests/test-plan.jmx' }}"
+          if [ ! -f "$TEST_PLAN" ]; then
+            echo "⚠️  No test plan at '$TEST_PLAN' — scaffolding a sample..."
+            mkdir -p tests
+            cat > "$TEST_PLAN" << 'JMX_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+            <hashTree>
+              <TestPlan guiclass="TestPlanGui" testclass="TestPlan"
+                        testname="itsrutik/conf — Sample Performance Test" enabled="true">
+                <stringProp name="TestPlan.comments">Auto-generated for itsrutik/conf</stringProp>
+                <boolProp name="TestPlan.functional_mode">false</boolProp>
+                <boolProp name="TestPlan.tearDown_on_shutdown">true</boolProp>
+                <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+                <elementProp name="TestPlan.user_defined_variables"
+                             elementType="Arguments" guiclass="ArgumentsPanel"
+                             testclass="Arguments" testname="User Defined Variables" enabled="true">
+                  <collectionProp name="Arguments.arguments"/>
+                </elementProp>
+              </TestPlan>
+              <hashTree>
+                <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup"
+                             testname="Load Thread Group" enabled="true">
+                  <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+                  <elementProp name="ThreadGroup.main_controller" elementType="LoopController"
+                               guiclass="LoopControlPanel" testclass="LoopController"
+                               testname="Loop Controller" enabled="true">
+                    <boolProp name="LoopController.continue_forever">false</boolProp>
+                    <stringProp name="LoopController.loops">3</stringProp>
+                  </elementProp>
+                  <stringProp name="ThreadGroup.num_threads">5</stringProp>
+                  <stringProp name="ThreadGroup.ramp_time">10</stringProp>
+                  <boolProp name="ThreadGroup.scheduler">false</boolProp>
+                </ThreadGroup>
+                <hashTree>
+                  <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy"
+                                    testname="GET /get — httpbin.org" enabled="true">
+                    <elementProp name="HTTPsampler.Arguments" elementType="Arguments"
+                                 guiclass="HTTPArgumentsPanel" testclass="Arguments"
+                                 testname="User Defined Variables" enabled="true">
+                      <collectionProp name="Arguments.arguments"/>
+                    </elementProp>
+                    <stringProp name="HTTPSampler.domain">httpbin.org</stringProp>
+                    <stringProp name="HTTPSampler.port">443</stringProp>
+                    <stringProp name="HTTPSampler.protocol">https</stringProp>
+                    <stringProp name="HTTPSampler.path">/get</stringProp>
+                    <stringProp name="HTTPSampler.method">GET</stringProp>
+                    <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
+                    <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+                  </HTTPSamplerProxy>
+                  <hashTree>
+                    <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion"
+                                       testname="Assert HTTP 200" enabled="true">
+                      <collectionProp name="Asserion.test_strings">
+                        <stringProp name="49586">200</stringProp>
+                      </collectionProp>
+                      <stringProp name="Assertion.custom_message">Expected HTTP 200</stringProp>
+                      <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+                      <boolProp name="Assertion.assume_success">false</boolProp>
+                      <intProp name="Assertion.test_type">8</intProp>
+                    </ResponseAssertion>
+                    <hashTree/>
+                    <DurationAssertion guiclass="DurationAssertionGui" testclass="DurationAssertion"
+                                       testname="Assert Response &lt; 3000ms" enabled="true">
+                      <longProp name="DurationAssertion.duration">3000</longProp>
+                    </DurationAssertion>
+                    <hashTree/>
+                  </hashTree>
+                </hashTree>
+              </hashTree>
+            </hashTree>
+          </jmeterTestPlan>
+          JMX_EOF
+            echo "✅ Sample JMX created at $TEST_PLAN"
+          fi
+
+      - name: Run JMeter in Non-GUI Mode
+        run: |
+          TEST_PLAN="${{ github.event.inputs.test_plan || 'tests/test-plan.jmx' }}"
+          echo "🚀 Executing: $TEST_PLAN"
+
+          "${{ env.JMETER_HOME }}/bin/jmeter" \
+            -n \
+            -t "$TEST_PLAN" \
+            -l "${{ github.workspace }}/results/results.jtl" \
+            -e \
+            -o "${{ github.workspace }}/results/html-report" \
+            -j "${{ github.workspace }}/results/jmeter.log" \
+            -Jjmeter.reportgenerator.overall_granularity=1000 \
+            -Dsummariser.interval=10
+
+          echo "✅ JMeter run complete"
+
+      - name: Enforce Pass Rate ≥ 95%
+        run: |
+          TOTAL=$(tail -n +2 "${{ github.workspace }}/results/results.jtl" | wc -l)
+          FAILED=$(grep -c ',false,' "${{ github.workspace }}/results/results.jtl" || echo 0)
+          PASSED=$(( TOTAL - FAILED ))
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "⚠️  No samples found in results."
+            exit 1
+          fi
+
+          PASS_RATE=$(echo "scale=2; $PASSED * 100 / $TOTAL" | bc)
+          echo "📊 Pass rate: ${PASS_RATE}%  (${PASSED}/${TOTAL})"
+
+          THRESHOLD=95
+          BELOW=$(echo "$PASS_RATE < $THRESHOLD" | bc)
+          if [ "$BELOW" -eq 1 ]; then
+            echo "❌ Pass rate ${PASS_RATE}% is below ${THRESHOLD}% threshold. Failing build."
+            exit 1
+          else
+            echo "✅ Pass rate ${PASS_RATE}% meets the ${THRESHOLD}% threshold."
+          fi
+
+      - name: Upload JTL Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-jtl-results
+          path: ${{ github.workspace }}/results/results.jtl
+          retention-days: 30
+
+      - name: Upload HTML Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-html-report
+          path: ${{ github.workspace }}/results/html-report
+          retention-days: 30
+
+      - name: Upload JMeter Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jmeter-logs
+          path: ${{ github.workspace }}/results/jmeter.log
+          retention-days: 7
+
+# ══════════════════════════════════════════════════════════════
+# JOB 4 — Publish Combined Summary
+# ══════════════════════════════════════════════════════════════
+  publish-summary:
+    name: 📋 Publish Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [build-and-test, run-performance-tests]
+    if: always()
+
+    steps:
+      - name: Download Surefire Reports
+        uses: actions/download-artifact@v4
+        with:
+          name: surefire-reports
+          path: surefire-reports/
+        continue-on-error: true
+
+      - name: Download JTL Results
+        uses: actions/download-artifact@v4
+        with:
+          name: jmeter-jtl-results
+          path: results/
+        continue-on-error: true
+
+      - name: Write Combined Summary
+        run: |
+          echo "# 📊 CI/CD Pipeline Summary — itsrutik/conf" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Maven Build & JUnit Tests | ${{ needs.build-and-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| JMeter Performance Tests  | ${{ needs.run-performance-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 🧪 Unit Tests (JUnit 4 / Surefire)" >> $GITHUB_STEP_SUMMARY
+          if ls surefire-reports/*.xml 2>/dev/null | head -1 | grep -q xml; then
+            TOTAL=$(grep -rh 'tests=' surefire-reports/*.xml 2>/dev/null | grep -oP 'tests="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            ERRORS=$(grep -rh 'errors=' surefire-reports/*.xml 2>/dev/null | grep -oP 'errors="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            FAILURES=$(grep -rh 'failures=' surefire-reports/*.xml 2>/dev/null | grep -oP 'failures="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            SKIPPED=$(grep -rh 'skipped=' surefire-reports/*.xml 2>/dev/null | grep -oP 'skipped="\K[0-9]+' | awk '{s+=$1} END {print s+0}')
+            echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔢 Total | ${TOTAL:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Passed | $(( ${TOTAL:-0} - ${ERRORS:-0} - ${FAILURES:-0} - ${SKIPPED:-0} )) |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ Failures | ${FAILURES:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🚫 Errors | ${ERRORS:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏭️ Skipped | ${SKIPPED:-0} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_Surefire reports unavailable._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## ⚡ Performance Tests (JMeter)" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results.jtl ]; then
+            TOTAL=$(tail -n +2 results/results.jtl | wc -l)
+            FAILED=$(grep -c ',false,' results/results.jtl || echo 0)
+            PASSED=$(( TOTAL - FAILED ))
+            PASS_PCT=$(echo "scale=1; $PASSED * 100 / $TOTAL" | bc 2>/dev/null || echo "N/A")
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔢 Total Requests | $TOTAL |" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Passed | $PASSED |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ Failed | $FAILED |" >> $GITHUB_STEP_SUMMARY
+            echo "| 📈 Pass Rate | ${PASS_PCT}% |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_JTL results unavailable (tests may have been skipped)._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 📁 Full HTML report in the **jmeter-html-report** artifact. Surefire XML in **surefire-reports**." >> $GITHUB_STEP_SUMMARY
